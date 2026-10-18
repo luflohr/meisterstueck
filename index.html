@@ -99,6 +99,11 @@
     <button id="ar-right" aria-label="Rechts drehen">⟳</button>
     <button id="ar-exit">Beenden</button>
   </div>
+  <div class="row">
+    <button id="ar-smaller" aria-label="Kleiner">−</button>
+    <button id="ar-scale" aria-label="Größe, antippen für 100 %">100&#8239;%</button>
+    <button id="ar-bigger" aria-label="Größer">+</button>
+  </div>
 </div>
 <div id="tip"></div>
 <div id="hint">Ziehen: drehen · Rechts/Shift: verschieben · Rad: zoomen</div>
@@ -19750,116 +19755,209 @@ app.root.addChild(reticle);
 
 const QUEST = /OculusBrowser|Quest/i.test(navigator.userAgent);
 const ar = {
-  mode: null, yaw: 0, hit: new pc.Vec3(), hitOk: false, viewerHit: null,
+  mode: null, yaw: 0, scale: 1, hit: new pc.Vec3(), hitOk: false, viewerHit: null,
   viewerPos: new pc.Vec3(), viewerHitT: -1, minY: Infinity, buttons: new Map(), worldUI: false,
   shadows: true
 };
+const SCALE_MIN = 0.2, SCALE_MAX = 2;
+const scaleLabel = v => Math.round(v * 100) + ' %';
 
-// ---- in-world menu (Quest Browser shows no DOM overlay in AR, and hands have no stick or grip)
-// A sign floating above the piece: status line + buttons. Hit-tested with the controller or hand ray.
-const MENU_W = 1152, MENU_H = 380, MENU_M = { w: 0.88, h: 0.88 * MENU_H / MENU_W };
-const menuCanvas = document.createElement('canvas'); menuCanvas.width = MENU_W; menuCanvas.height = MENU_H;
-const menuTex = new pc.Texture(app.graphicsDevice, { width: MENU_W, height: MENU_H, format: pc.PIXELFORMAT_RGBA8, name: 'arMenu', mipmaps: true });
-menuTex.minFilter = pc.FILTER_LINEAR_MIPMAP_LINEAR; menuTex.anisotropy = 4;
-const MENU_BTNS = [
-  { id: 'place', w: 290, label: 'Neu platzieren' },
-  { id: 'left',  w: 130, icon: 'ccw' },
-  { id: 'right', w: 130, icon: 'cw' },
-  { id: 'all',   w: 290, label: () => Object.values(state).some(s => s.target === 1) ? 'Alle schließen' : 'Alle öffnen' },
-  { id: 'exit',  w: 200, label: 'Beenden', exit: true },
-];
-{ // lay the buttons out in one row
-  const gap = 16, total = MENU_BTNS.reduce((a, b) => a + b.w, 0) + gap * (MENU_BTNS.length - 1);
-  let x = (MENU_W - total) / 2;
-  for (const b of MENU_BTNS) { b.x = x; b.y = 172; b.h = 160; x += b.w + gap; }
+// ================================================================ in-world control panel
+// Quest Browser has no DOM overlay in AR and hands have no stick or grip, so the controls live in the
+// room: a floating window in the Horizon OS style (dark rounded panel, pill buttons, slider) with the
+// usual grab bar underneath. The window is independent of the furniture: grab the bar and move it.
+const UI_W = 1024, UI_H = 570, UI_M = 0.64;                 // canvas px, physical width in metres
+const UI_COL = {
+  panel: 'rgba(28,30,33,0.93)', btn: 'rgba(255,255,255,0.10)', hover: 'rgba(255,255,255,0.22)',
+  primary: '#0866ff', ink: '#e4e6eb', sub: '#b0b3b8', faint: 'rgba(255,255,255,0.08)'
+};
+const UI_EL = [];
+{ // layout
+  const m = 48, g = 20;
+  let x = m;
+  const rowA = { y: 150, h: 104 }, rowB = { y: 292, h: 104 }, rowC = { y: 434, h: 96 };
+  const add = (id, w, row, extra = {}) => { const e = { id, x, y: row.y, w, h: row.h, ...extra }; UI_EL.push(e); x += w + g; return e; };
+  add('place', 330, rowA, { label: 'Neu platzieren' });
+  add('left', 104, rowA, { icon: 'ccw', round: true });
+  add('right', 104, rowA, { icon: 'cw', round: true });
+  add('all', 330, rowA, { label: () => Object.values(state).some(s => s.target === 1) ? 'Alle schließen' : 'Alle öffnen' });
+  x = m + 120 + 16;
+  add('minus', 104, rowB, { label: '−', round: true, big: true }); x += 4;
+  add('slider', 370, rowB, { slider: true }); x += 4;
+  add('plus', 104, rowB, { label: '+', round: true, big: true }); x -= 4;
+  add('value', 150, rowB, { value: true });
+  x = UI_W - m - 240;
+  add('exit', 240, rowC, { label: 'Beenden' });
 }
-const menu = { hover: -1, drawn: '', ent: null };
+const ui = { root: null, panel: null, grab: null, hover: null, grabHover: false, drawn: '', drag: null, spawned: false, suppress: new Set() };
+const uiCanvas = document.createElement('canvas'); uiCanvas.width = UI_W; uiCanvas.height = UI_H;
+const uiTex = new pc.Texture(app.graphicsDevice, { width: UI_W, height: UI_H, format: pc.PIXELFORMAT_RGBA8, name: 'arPanel', mipmaps: true });
+uiTex.minFilter = pc.FILTER_LINEAR_MIPMAP_LINEAR; uiTex.anisotropy = 4;
+const grabCanvas = document.createElement('canvas'); grabCanvas.width = 256; grabCanvas.height = 48;
+const grabTex = new pc.Texture(app.graphicsDevice, { width: 256, height: 48, format: pc.PIXELFORMAT_RGBA8, name: 'arGrab' });
+const FONT = (w, s) => `${w} ${s}px Inter, "Roboto", system-ui, sans-serif`;
 function rr(g, x, y, w, h, r) { g.beginPath(); g.roundRect ? g.roundRect(x, y, w, h, r) : g.rect(x, y, w, h); }
 function arrow(g, cx, cy, cw) {           // circular arrow, drawn so it never depends on a font glyph
-  g.save(); g.translate(cx, cy); if (!cw) g.scale(-1, 1);     // counter-clockwise = mirrored clockwise
-  const r = 34, a0 = -Math.PI * 0.85, a1 = Math.PI * 0.45;
-  g.lineWidth = 10; g.lineCap = 'round'; g.beginPath(); g.arc(0, 0, r, a0, a1); g.stroke();
+  g.save(); g.translate(cx, cy); if (!cw) g.scale(-1, 1);
+  const r = 26, a0 = -Math.PI * 0.85, a1 = Math.PI * 0.45;
+  g.lineWidth = 8; g.lineCap = 'round'; g.beginPath(); g.arc(0, 0, r, a0, a1); g.stroke();
   const ex = r * Math.cos(a1), ey = r * Math.sin(a1), t = a1 + Math.PI / 2;
   g.beginPath();
-  g.moveTo(ex + 18 * Math.cos(t), ey + 18 * Math.sin(t));
-  g.lineTo(ex + 15 * Math.cos(t + 2.3), ey + 15 * Math.sin(t + 2.3));
-  g.lineTo(ex + 15 * Math.cos(t - 2.3), ey + 15 * Math.sin(t - 2.3));
+  g.moveTo(ex + 15 * Math.cos(t), ey + 15 * Math.sin(t));
+  g.lineTo(ex + 12 * Math.cos(t + 2.3), ey + 12 * Math.sin(t + 2.3));
+  g.lineTo(ex + 12 * Math.cos(t - 2.3), ey + 12 * Math.sin(t - 2.3));
   g.closePath(); g.fill(); g.restore();
 }
-function menuStatus() {
+const sliderT = v => (v - SCALE_MIN) / (SCALE_MAX - SCALE_MIN);
+const sliderTrack = e => ({ x0: e.x + 26, x1: e.x + e.w - 26, y: e.y + e.h / 2 });
+function uiStatus() {
   return ar.mode === 'placing' ? 'Auf den Boden zielen · Trigger oder Pinch stellt das Möbel ab'
     : 'Tür oder Schublade anzielen · Trigger oder Pinch öffnet';
 }
-function drawMenu() {
-  const placing = ar.mode === 'placing';
-  const key = [ar.mode, menu.hover, MENU_BTNS.map(b => typeof b.label === 'function' ? b.label() : '').join()].join('|');
-  if (key === menu.drawn) return;
-  menu.drawn = key;
-  const g = menuCanvas.getContext('2d');
-  g.clearRect(0, 0, MENU_W, MENU_H);
-  g.fillStyle = 'rgba(24,23,21,0.86)'; rr(g, 0, 0, MENU_W, placing ? 148 : MENU_H, 36); g.fill();
-  g.fillStyle = '#efede8'; g.textAlign = 'center'; g.textBaseline = 'middle';
-  g.font = '600 44px Inter, "Roboto", system-ui, sans-serif';
-  g.fillText('Meisterstück', MENU_W / 2, 50);
-  g.font = '400 34px Inter, "Roboto", system-ui, sans-serif'; g.fillStyle = '#c9c4ba';
-  g.fillText(menuStatus(), MENU_W / 2, 106);
-  if (placing) { menuTex.setSource(menuCanvas); return; }
-  MENU_BTNS.forEach((b, i) => {
-    const hot = i === menu.hover;
-    g.fillStyle = hot ? '#d39a5c' : b.exit ? 'rgba(255,255,255,0.08)' : 'rgba(255,255,255,0.14)';
-    rr(g, b.x, b.y, b.w, b.h, 24); g.fill();
-    if (b.exit && !hot) { g.strokeStyle = 'rgba(211,154,92,0.9)'; g.lineWidth = 4; rr(g, b.x + 2, b.y + 2, b.w - 4, b.h - 4, 22); g.stroke(); }
-    const ink = hot ? '#1b1a19' : '#efede8';
-    g.fillStyle = ink; g.strokeStyle = ink;
-    if (b.icon) arrow(g, b.x + b.w / 2, b.y + b.h / 2, b.icon === 'cw');
-    else {
-      g.font = '600 40px Inter, "Roboto", system-ui, sans-serif';
-      g.fillText(typeof b.label === 'function' ? b.label() : b.label, b.x + b.w / 2, b.y + b.h / 2 + 1);
+const disabled = id => id === 'place' && ar.mode === 'placing';
+function drawUI() {
+  const dragging = ui.drag?.kind === 'slider';
+  const key = [ar.mode, ui.hover, ui.grabHover, !!ui.drag, ui.drag?.kind, ar.scale.toFixed(3),
+    Object.values(state).some(s => s.target === 1)].join('|');
+  if (key === ui.drawn) return;
+  ui.drawn = key;
+  const g = uiCanvas.getContext('2d');
+  g.clearRect(0, 0, UI_W, UI_H);
+  g.fillStyle = UI_COL.panel; rr(g, 0, 0, UI_W, UI_H, 40); g.fill();
+  g.textBaseline = 'middle'; g.textAlign = 'left';
+  g.fillStyle = UI_COL.ink; g.font = FONT(600, 40); g.fillText('Meisterstück', 48, 58);
+  g.fillStyle = UI_COL.sub; g.font = FONT(400, 28); g.fillText(uiStatus(), 48, 104);
+  g.fillStyle = UI_COL.faint; g.fillRect(48, 132, UI_W - 96, 2);
+  g.fillStyle = UI_COL.ink; g.font = FONT(500, 32); g.fillText('Größe', 48, 344);
+  g.fillStyle = UI_COL.sub; g.font = FONT(400, 26); g.fillText('Leiste unten greifen zum Verschieben', 48, 482);
+  for (const e of UI_EL) {
+    const hot = ui.hover === e.id, off = disabled(e.id);
+    g.globalAlpha = off ? 0.35 : 1;
+    if (e.slider) {
+      const tr = sliderTrack(e), t = sliderT(ar.scale), kx = tr.x0 + (tr.x1 - tr.x0) * t;
+      g.fillStyle = 'rgba(255,255,255,0.18)'; rr(g, tr.x0, tr.y - 6, tr.x1 - tr.x0, 12, 6); g.fill();
+      g.fillStyle = UI_COL.primary; rr(g, tr.x0, tr.y - 6, Math.max(12, kx - tr.x0), 12, 6); g.fill();
+      const tx = tr.x0 + (tr.x1 - tr.x0) * sliderT(1);                      // 100 % tick
+      g.fillStyle = 'rgba(255,255,255,0.55)'; g.fillRect(tx - 2, tr.y + 16, 4, 14);
+      if (hot || dragging) { g.fillStyle = 'rgba(8,102,255,0.28)'; g.beginPath(); g.arc(kx, tr.y, 38, 0, Math.PI * 2); g.fill(); }
+      g.fillStyle = '#fff'; g.beginPath(); g.arc(kx, tr.y, 24, 0, Math.PI * 2); g.fill();
+      continue;
     }
-  });
-  menuTex.setSource(menuCanvas);
+    if (e.value) {
+      g.fillStyle = hot ? UI_COL.hover : 'transparent'; rr(g, e.x, e.y + 12, e.w, e.h - 24, 18); g.fill();
+      g.fillStyle = UI_COL.ink; g.font = FONT(600, 36); g.textAlign = 'center';
+      g.fillText(scaleLabel(ar.scale), e.x + e.w / 2, e.y + e.h / 2 + 1); g.textAlign = 'left';
+      continue;
+    }
+    g.fillStyle = hot && !off ? UI_COL.hover : UI_COL.btn;
+    if (e.round) { g.beginPath(); g.arc(e.x + e.w / 2, e.y + e.h / 2, e.w / 2, 0, Math.PI * 2); }
+    else rr(g, e.x, e.y, e.w, e.h, e.h / 2);
+    g.fill();
+    if (hot && !off) { g.strokeStyle = UI_COL.primary; g.lineWidth = 4; g.stroke(); }
+    g.fillStyle = UI_COL.ink; g.strokeStyle = UI_COL.ink;
+    if (e.icon) arrow(g, e.x + e.w / 2, e.y + e.h / 2, e.icon === 'cw');
+    else {
+      g.font = FONT(600, e.big ? 54 : 34); g.textAlign = 'center';
+      g.fillText(typeof e.label === 'function' ? e.label() : e.label, e.x + e.w / 2, e.y + e.h / 2 + (e.big ? 3 : 1));
+      g.textAlign = 'left';
+    }
+  }
+  g.globalAlpha = 1;
+  uiTex.setSource(uiCanvas);
+  // grab bar
+  const gg = grabCanvas.getContext('2d'), on = ui.grabHover || ui.drag?.kind === 'grab';
+  gg.clearRect(0, 0, 256, 48);
+  gg.fillStyle = on ? '#ffffff' : 'rgba(255,255,255,0.55)';
+  rr(gg, on ? 8 : 28, 12, on ? 240 : 200, 24, 12); gg.fill();
+  grabTex.setSource(grabCanvas);
 }
-{
+function uiPlane(name, tex, w, h) {
   const m = new pc.StandardMaterial();
   m.useLighting = false; m.useSkybox = false; m.useFog = false; m.useTonemap = false;
-  m.diffuse = new pc.Color(0, 0, 0); m.emissive = WHITE; m.emissiveMap = menuTex;
-  m.opacityMap = menuTex; m.opacityMapChannel = 'a'; m.blendType = pc.BLEND_NORMAL; m.depthWrite = false;
+  m.diffuse = new pc.Color(0, 0, 0); m.emissive = WHITE; m.emissiveMap = tex;
+  m.opacityMap = tex; m.opacityMapChannel = 'a'; m.blendType = pc.BLEND_NORMAL; m.depthWrite = false;
   m.update();
-  menu.ent = new pc.Entity('arMenu');
-  menu.ent.addComponent('render', { type: 'plane', material: m, castShadows: false, receiveShadows: false });
-  menu.ent.setLocalScale(MENU_M.w, 1, MENU_M.h);
-  menu.ent.enabled = false;
-  modelRoot.addChild(menu.ent);
+  const e = new pc.Entity(name);
+  e.addComponent('render', { type: 'plane', material: m, castShadows: false, receiveShadows: false });
+  e.setLocalScale(w, 1, h);
+  e.setLocalEulerAngles(90, 0, 0);          // plane normal (+Y) -> root +Z (towards the viewer), texture top up
+  return e;
 }
-function placeMenu(top, frontZ) {           // above the piece, a little forward, tipped towards the viewer
-  menu.ent.setLocalPosition(0, top + 0.42, frontZ - 0.12);
-  menu.ent.setLocalEulerAngles(78, 0, 0);
+{
+  ui.root = new pc.Entity('arPanelRoot');
+  const h = UI_M * UI_H / UI_W;
+  ui.panel = uiPlane('arPanel', uiTex, UI_M, h);
+  ui.grab = uiPlane('arGrab', grabTex, 0.16, 0.03);
+  ui.grab.setLocalPosition(0, -h / 2 - 0.035, 0);
+  ui.root.addChild(ui.panel); ui.root.addChild(ui.grab);
+  ui.root.enabled = false;
+  app.root.addChild(ui.root);
 }
-placeMenu(0.8, 0.25);
-// ray -> button index (or -2 for "panel, but no button"), with distance
-const menuInv = new pc.Mat4(), mo = new pc.Vec3(), md = new pc.Vec3();
-function rayMenu(origin, dir) {
-  if (!menu.ent.enabled) return null;
-  menuInv.copy(menu.ent.getWorldTransform()).invert();
-  menuInv.transformPoint(origin, mo); menuInv.transformVector(dir, md);
-  if (Math.abs(md.y) < 1e-6) return null;
-  const t = -mo.y / md.y; if (t <= 0) return null;
-  const x = mo.x + md.x * t, z = mo.z + md.z * t;
-  if (x < -0.5 || x > 0.5 || z < -0.5 || z > 0.5) return null;
-  const px = (x + 0.5) * MENU_W, py = (z + 0.5) * MENU_H;
-  if (ar.mode === 'placing' && py > 148) return null;    // only the status strip is drawn while placing
-  const world = new pc.Vec3(md.x, md.y, md.z).mulScalar(t);
-  menu.ent.getWorldTransform().transformVector(world, world);
-  const i = ar.mode === 'placing' ? -1 : MENU_BTNS.findIndex(b => px >= b.x && px <= b.x + b.w && py >= b.y && py <= b.y + b.h);
-  return { index: i < 0 ? -2 : i, t: world.length() };
+// ray against a UI plane -> uv (0..1, top-left origin) and world distance
+const pInv = new pc.Mat4(), po = new pc.Vec3(), pd = new pc.Vec3(), pw = new pc.Vec3();
+function hitPlane(ent, origin, dir, pad = 0) {
+  pInv.copy(ent.getWorldTransform()).invert();
+  pInv.transformPoint(origin, po); pInv.transformVector(dir, pd);
+  if (Math.abs(pd.y) < 1e-6) return null;
+  const t = -po.y / pd.y; if (t <= 0) return null;
+  const u = po.x + pd.x * t + 0.5, v = po.z + pd.z * t + 0.5;
+  if (u < -pad || u > 1 + pad || v < -pad || v > 1 + pad) return null;
+  pw.set(pd.x, pd.y, pd.z).mulScalar(t);
+  ent.getWorldTransform().transformVector(pw, pw);
+  return { u, v, t: pw.length() };
 }
-function menuAction(i) {
-  const b = MENU_BTNS[i]; if (!b) return;
-  if (b.id === 'place') replace();
-  else if (b.id === 'left') rotate(15);
-  else if (b.id === 'right') rotate(-15);
-  else if (b.id === 'all') toggleAll();
-  else if (b.id === 'exit') app.xr.end();
+function uiRay(origin, dir) {
+  if (!ui.root.enabled) return null;
+  const g = hitPlane(ui.grab, origin, dir, 0.35);
+  if (g) return { id: 'grab', t: g.t };
+  const p = hitPlane(ui.panel, origin, dir);
+  if (!p) return null;
+  const px = p.u * UI_W, py = p.v * UI_H;
+  const e = UI_EL.find(e => px >= e.x && px <= e.x + e.w && py >= e.y && py <= e.y + e.h);
+  return { id: e ? e.id : 'panel', t: p.t, px };
+}
+function sliderFromRay(origin, dir) {
+  const p = hitPlane(ui.panel, origin, dir, Infinity); if (!p) return;
+  const tr = sliderTrack(UI_EL.find(e => e.slider));
+  const t = pc.math.clamp((p.u * UI_W - tr.x0) / (tr.x1 - tr.x0), 0, 1);
+  setScale(SCALE_MIN + t * (SCALE_MAX - SCALE_MIN), true);
+}
+function uiAction(id) {
+  if (disabled(id)) return;
+  if (id === 'place') replace();
+  else if (id === 'left') rotate(15);
+  else if (id === 'right') rotate(-15);
+  else if (id === 'all') toggleAll();
+  else if (id === 'minus') setScale(Math.floor((ar.scale - 1e-4) * 10) / 10);
+  else if (id === 'plus') setScale(Math.ceil((ar.scale + 1e-4) * 10) / 10);
+  else if (id === 'value') setScale(1);
+  else if (id === 'exit') app.xr.end();
+}
+// window placement: in front of the viewer, a bit to the left and below eye level, always facing them
+const headPos = new pc.Vec3(), fwd = new pc.Vec3();
+function faceHead(root) {
+  const p = root.getPosition(); headPos.copy(camera.getPosition());
+  const yaw = Math.atan2(headPos.x - p.x, headPos.z - p.z) * pc.math.RAD_TO_DEG;
+  const pitch = Math.atan2(headPos.y - p.y, Math.hypot(headPos.x - p.x, headPos.z - p.z)) * pc.math.RAD_TO_DEG;
+  root.setEulerAngles(0, yaw, 0); root.rotateLocal(-pitch, 0, 0);
+}
+function spawnUI() {
+  headPos.copy(camera.getPosition());
+  fwd.copy(camera.forward); fwd.y = 0;
+  if (fwd.lengthSq() < 1e-4) fwd.set(0, 0, -1);
+  fwd.normalize();
+  const a = 28 * pc.math.DEG_TO_RAD, c = Math.cos(a), s = Math.sin(a);   // turn 28° to the left
+  const x = fwd.x * c + fwd.z * s, z = -fwd.x * s + fwd.z * c;
+  ui.root.setPosition(headPos.x + x * 0.8, Math.max(0.6, headPos.y - 0.3), headPos.z + z * 0.8);
+  faceHead(ui.root);
+  ui.spawned = true;
+}
+function setScale(v, fine) {
+  v = pc.math.clamp(v, SCALE_MIN, SCALE_MAX);
+  if (fine) { v = Math.round(v * 100) / 100; if (Math.abs(v - 1) < 0.035) v = 1; }   // snaps to 100 %
+  ar.scale = v;
+  modelRoot.setLocalScale(v, v, v);
+  const lab = document.getElementById('ar-scale'); if (lab) lab.textContent = scaleLabel(v);
 }
 function toggleAll() {
   const anyOpen = Object.values(state).some(s => s.target === 1);
@@ -19914,9 +20012,10 @@ app.xr.on('start', () => {
   ar.shadows = sun.light.castShadows; sun.light.castShadows = false;
   try { app.xr.fixedFoveation = 0.5; } catch (e) { /* not supported */ }
   ar.mode = 'placing'; ar.hitOk = false; ar.viewerHitT = -1; ar.minY = Infinity; ar.yaw = 0;
+  setScale(1);
   // no DOM overlay (Quest Browser) -> controls live in the room instead
   ar.worldUI = !app.xr.domOverlay.available;
-  menu.ent.enabled = ar.worldUI; menu.hover = -1; menu.drawn = ''; drawMenu();
+  ui.root.enabled = ar.worldUI; ui.spawned = false; ui.drag = null; ui.hover = null; ui.drawn = ''; drawUI();
   arMsg.textContent = 'Boden anvisieren, dann tippen zum Platzieren';
   // phones: hit test from the screen centre, floor only. Quest knows its floor exactly (local-floor y = 0),
   // so it never uses hit-test results, which could land on a table or a wall.
@@ -19939,53 +20038,91 @@ app.xr.on('start', () => {
 });
 app.xr.on('end', () => {
   document.body.classList.remove('xr');
-  applyBg(); floor.enabled = true; blob.enabled = false; reticle.enabled = false; menu.ent.enabled = false;
+  applyBg(); floor.enabled = true; blob.enabled = false; reticle.enabled = false; ui.root.enabled = false;
   sun.light.castShadows = ar.shadows;
-  ar.viewerHit?.remove?.(); ar.viewerHit = null; ar.mode = null;
-  modelRoot.setPosition(0, 0, 0); modelRoot.setEulerAngles(0, 0, 0);
+  ar.viewerHit?.remove?.(); ar.viewerHit = null; ar.mode = null; ui.drag = null;
+  modelRoot.setPosition(0, 0, 0); modelRoot.setEulerAngles(0, 0, 0); setScale(1);
 });
 const replace = () => {
   if (!app.xr.active) return;
   ar.mode = 'placing'; ar.hitOk = false; ar.viewerHitT = -1;
   arMsg.textContent = 'Boden anvisieren, dann tippen zum Platzieren';
-  drawMenu();
 };
 const rotate = deg => { ar.yaw += deg; if (ar.mode === 'placed') modelRoot.rotateLocal(0, deg, 0); };
 
+// press on the grab bar or the slider starts a drag; the click that follows is swallowed
+app.xr.input.on('selectstart', src => {
+  ui.suppress.delete(src);
+  const h = uiRay(src.getOrigin(), src.getDirection());
+  if (!h) return;
+  if (h.id === 'grab') {
+    const o = src.getOrigin(), d = src.getDirection(), p = ui.root.getPosition();
+    const dist = p.distance(o);
+    ui.drag = { src, kind: 'grab', dist, offset: p.clone().sub(d.clone().mulScalar(dist).add(o)) };
+    ui.suppress.add(src);
+  } else if (h.id === 'slider') {
+    ui.drag = { src, kind: 'slider' };
+    sliderFromRay(src.getOrigin(), src.getDirection());
+    ui.suppress.add(src);
+  }
+});
+app.xr.input.on('selectend', src => { if (ui.drag?.src === src) ui.drag = null; });
+
 // select = screen tap (phone), trigger or pinch (Quest)
 app.xr.input.on('select', src => {
+  if (ui.suppress.delete(src)) return;
+  const o = src.getOrigin(), d = src.getDirection();
+  const h = uiRay(o, d);
+  if (h) { uiAction(h.id); return; }                  // the panel is in front: never place or open through it
   if (ar.mode === 'placing') {
     if (!ar.hitOk) return;
     ar.mode = 'placed'; reticle.enabled = false;
     arMsg.textContent = 'Tür oder Schublade antippen';
-    drawMenu();
     return;
   }
   if (ar.mode === 'placed') {
-    const o = src.getOrigin(), d = src.getDirection();
-    const m = rayMenu(o, d), hit = rayPick(o, d);
-    if (m && (!hit || m.t < hit.t)) { if (m.index >= 0) menuAction(m.index); return; }
+    const hit = rayPick(o, d);
     if (hit) toggle(hit.name);
   }
 });
 app.xr.input.on('squeezestart', replace);    // Quest grip button: place again
 
-const camPos = new pc.Vec3(), lineEnd = new pc.Vec3();
+const camPos = new pc.Vec3(), lineEnd = new pc.Vec3(), BLUE = new pc.Color(0.03, 0.4, 1);
 app.on('update', dt => {
   if (!app.xr.active || !ar.mode) return;
+  if (ar.worldUI) {
+    if (!ui.spawned && camera.getPosition().y > 0.3) spawnUI();
+    else if (ui.spawned && !ui.drag && ui.root.getPosition().distance(camera.getPosition()) > 3.5) spawnUI();   // lost it? bring it back
+  }
   // pointer devices (Quest controllers / hands) override the head/screen-centre hit test
-  let pointerHit = null, hover = -1;
+  let pointerHit = null, hover = null, grabHover = false;
   for (const src of app.xr.input.inputSources) {
     if (src.targetRayMode !== pc.XRTARGETRAY_POINTER) continue;
     const o = src.getOrigin(), d = src.getDirection();
     let col = WHITE, len = 3;
-    if (ar.mode === 'placing') {
-      const f = rayFloor(o, d);
-      if (f) { pointerHit = f; len = f.distance(o); }
+    if (ui.drag?.src === src) {
+      if (ui.drag.kind === 'grab') {
+        ui.root.setPosition(d.clone().mulScalar(ui.drag.dist).add(o).add(ui.drag.offset));
+        faceHead(ui.root);
+        len = ui.drag.dist; grabHover = true;
+      } else {
+        sliderFromRay(o, d); hover = 'slider';
+        len = hitPlane(ui.panel, o, d, Infinity)?.t ?? 1;
+      }
+      col = BLUE;
     } else {
-      const h = rayPick(o, d), m = rayMenu(o, d);
-      if (m && (!h || m.t < h.t)) { len = m.t; if (m.index >= 0) { col = ACCENT; hover = m.index; } }
-      else if (h) { col = ACCENT; len = h.t; }
+      const h = uiRay(o, d);
+      if (h) {
+        len = h.t;
+        if (h.id === 'grab') { grabHover = true; col = BLUE; }
+        else if (h.id !== 'panel' && !disabled(h.id)) { hover = h.id; col = BLUE; }
+      } else if (ar.mode === 'placing') {
+        const f = rayFloor(o, d);
+        if (f) { pointerHit = f; len = f.distance(o); }
+      } else {
+        const p = rayPick(o, d);
+        if (p) { col = ACCENT; len = p.t; }
+      }
     }
     lineEnd.copy(d).mulScalar(len).add(o);
     app.drawLine(o, lineEnd, col);
@@ -20001,7 +20138,7 @@ app.on('update', dt => {
       ar.buttons.set(src, pressed);
     }
   }
-  if (ar.worldUI) { menu.hover = hover; drawMenu(); }
+  if (ar.worldUI) { ui.hover = hover; ui.grabHover = grabHover; drawUI(); }
   if (ar.mode !== 'placing') return;
   // floor only: pointer ray on the floor plane, else (phones) a recent hit-test result on the lowest
   // horizontal surface, else the floor where the user looks. Old results expire after 250 ms.
@@ -20012,7 +20149,7 @@ app.on('update', dt => {
   if (!ar.hitOk) { reticle.enabled = false; return; }
   ar.hit.copy(target);
   reticle.enabled = true; reticle.setPosition(ar.hit);
-  // live preview at real size, front turned towards the viewer
+  // live preview, front turned towards the viewer
   camPos.copy(camera.getPosition());
   const face = Math.atan2(camPos.x - ar.hit.x, camPos.z - ar.hit.z) * pc.math.RAD_TO_DEG;
   modelRoot.setPosition(ar.hit);
@@ -20028,6 +20165,10 @@ document.getElementById('ar-place').onclick = replace;
 document.getElementById('ar-left').onclick = () => rotate(15);
 document.getElementById('ar-right').onclick = () => rotate(-15);
 document.getElementById('ar-exit').onclick = () => app.xr.end();
+document.getElementById('ar-smaller').onclick = () => uiAction('minus');
+document.getElementById('ar-bigger').onclick = () => uiAction('plus');
+document.getElementById('ar-scale').onclick = () => setScale(1);
+
 // ---- availability / platform buttons
 function quickLook(b64) {
   const data = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
@@ -20046,7 +20187,7 @@ function updateArButtons() {
   document.getElementById('ar-start').hidden = !webxr;
   document.getElementById('ql-row').hidden = !qlSupported;
   document.getElementById('ar-note').textContent =
-    webxr ? (QUEST ? 'Originalgröße 1:1. Zielen + Trigger oder Pinch öffnet. Das Schild über dem Möbel dreht, platziert neu und beendet AR. Controller: Stick dreht, Grip platziert neu. Beenden auch über die Meta-Taste.'
+    webxr ? (QUEST ? 'Originalgröße 1:1. Zielen + Trigger oder Pinch öffnet. Das Bedienfeld (an der Leiste darunter verschiebbar) dreht, skaliert, platziert neu und beendet AR. Controller: Stick dreht, Grip platziert neu. Beenden auch über die Meta-Taste.'
              : 'Originalgröße 1:1. Boden anvisieren und tippen, dann Türen und Schubladen antippen.')
     : qlSupported ? 'Quick Look zeigt das Möbel in Originalgröße (ohne Interaktion).'
     : !window.isSecureContext ? 'AR braucht HTTPS. Seite über https:// öffnen.'
@@ -20076,13 +20217,6 @@ asset.ready(a => {
     }
     const p = s.node.getPosition();
     s.min = box.getMin().clone().sub(p); s.max = box.getMax().clone().sub(p);
-  }
-  { // fit the AR menu sign above the piece
-    const all = new pc.BoundingBox(); let first = true;
-    for (const r of ent.findComponents('render')) for (const mi of r.meshInstances) {
-      if (first) { all.copy(mi.aabb); first = false; } else all.add(mi.aabb);
-    }
-    if (!first) placeMenu(all.getMax().y, all.getMax().z);
   }
   buildUI();
   document.getElementById('loading').remove();
