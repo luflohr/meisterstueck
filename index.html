@@ -19760,16 +19760,20 @@ const QUEST = /OculusBrowser|Quest/i.test(navigator.userAgent);
 const ar = {
   mode: null, yaw: 0, scale: 1, hit: new pc.Vec3(), hitOk: false, viewerHit: null,
   viewerPos: new pc.Vec3(), viewerHitT: -1, minY: Infinity, buttons: new Map(), worldUI: false,
-  shadows: true
+  shadows: true,
+  // pose: t = where the piece should be (from pointer / hands), d = after wall snap, c = smoothed, shown
+  tPos: new pc.Vec3(), tYaw: 0, dPos: new pc.Vec3(), dYaw: 0, cPos: new pc.Vec3(), cYaw: 0, fresh: true,
+  snapOn: true, snapped: null, grabs: new Map(), two: null
 };
 const SCALE_MIN = 0.2, SCALE_MAX = 2;
 const scaleLabel = v => Math.round(v * 100) + ' %';
+const modelExt = { minX: -1.03, maxX: 1.03, minZ: -0.25, maxZ: 0.25, maxY: 0.8 };   // refined after load
 
 // ================================================================ in-world control panel
 // Quest Browser has no DOM overlay in AR and hands have no stick or grip, so the controls live in the
 // room: a floating window in the Horizon OS style (dark rounded panel, pill buttons, slider) with the
 // usual grab bar underneath. The window is independent of the furniture: grab the bar and move it.
-const UI_W = 1024, UI_H = 570, UI_M = 0.64;                 // canvas px, physical width in metres
+const UI_W = 1024, UI_H = 620, UI_M = 0.64;                 // canvas px, physical width in metres
 const UI_COL = {
   panel: 'rgba(28,30,33,0.93)', btn: 'rgba(255,255,255,0.10)', hover: 'rgba(255,255,255,0.22)',
   primary: '#0866ff', ink: '#e4e6eb', sub: '#b0b3b8', faint: 'rgba(255,255,255,0.08)'
@@ -19789,6 +19793,8 @@ const UI_EL = [];
   add('slider', 370, rowB, { slider: true }); x += 4;
   add('plus', 104, rowB, { label: '+', round: true, big: true }); x -= 4;
   add('value', 150, rowB, { value: true });
+  x = m;
+  add('snap', 470, rowC, { toggle: true });
   x = UI_W - m - 240;
   add('exit', 240, rowC, { label: 'Beenden' });
 }
@@ -19800,6 +19806,11 @@ const grabCanvas = document.createElement('canvas'); grabCanvas.width = 256; gra
 const grabTex = new pc.Texture(app.graphicsDevice, { width: 256, height: 48, format: pc.PIXELFORMAT_RGBA8, name: 'arGrab' });
 const FONT = (w, s) => `${w} ${s}px Inter, "Roboto", system-ui, sans-serif`;
 function rr(g, x, y, w, h, r) { g.beginPath(); g.roundRect ? g.roundRect(x, y, w, h, r) : g.rect(x, y, w, h); }
+function fitText(g, text, x, y, maxW, weight, size) {      // shrink the font until the line fits
+  let s = size; g.font = FONT(weight, s);
+  while (s > 16 && g.measureText(text).width > maxW) { s -= 1; g.font = FONT(weight, s); }
+  g.fillText(text, x, y);
+}
 function arrow(g, cx, cy, cw) {           // circular arrow, drawn so it never depends on a font glyph
   g.save(); g.translate(cx, cy); if (!cw) g.scale(-1, 1);
   const r = 26, a0 = -Math.PI * 0.85, a1 = Math.PI * 0.45;
@@ -19813,15 +19824,20 @@ function arrow(g, cx, cy, cw) {           // circular arrow, drawn so it never d
 }
 const sliderT = v => (v - SCALE_MIN) / (SCALE_MAX - SCALE_MIN);
 const sliderTrack = e => ({ x0: e.x + 26, x1: e.x + e.w - 26, y: e.y + e.h / 2 });
+const wallsKnown = () => app.xr.planeDetection.available && wallPlanes().length > 0;
 function uiStatus() {
+  if (ar.snapped && (ar.mode === 'placing' || ar.two || [...ar.grabs.values()].some(g => g.moved)))
+    return 'An der Wand ausgerichtet · weiter wegziehen oder drehen löst';
   return ar.mode === 'placing' ? 'Auf den Boden zielen · Trigger oder Pinch stellt das Möbel ab'
-    : 'Tür oder Schublade anzielen · Trigger oder Pinch öffnet';
+    : 'Antippen: öffnen · Halten und ziehen: verschieben · Zwei Hände: drehen, skalieren';
 }
-const disabled = id => id === 'place' && ar.mode === 'placing';
+const snapLabel = () => !app.xr.planeDetection.available ? 'Wand-Ausrichtung: keine Raumdaten'
+  : !wallsKnown() ? 'Wand-Ausrichtung: keine Wände' : 'Wand-Ausrichtung: ' + (ar.snapOn ? 'An' : 'Aus');
+const disabled = id => (id === 'place' && ar.mode === 'placing') || (id === 'snap' && !wallsKnown());
 function drawUI() {
   const dragging = ui.drag?.kind === 'slider';
   const key = [ar.mode, ui.hover, ui.grabHover, !!ui.drag, ui.drag?.kind, ar.scale.toFixed(3),
-    Object.values(state).some(s => s.target === 1)].join('|');
+    Object.values(state).some(s => s.target === 1), uiStatus(), snapLabel()].join('|');
   if (key === ui.drawn) return;
   ui.drawn = key;
   const g = uiCanvas.getContext('2d');
@@ -19830,13 +19846,13 @@ function drawUI() {
   g.textBaseline = 'middle'; g.textAlign = 'left';
   g.fillStyle = UI_COL.ink; g.font = FONT(600, 40); g.fillText('Meisterstück', 48, 58);
   { const w = g.measureText('Meisterstück').width; g.fillStyle = UI_COL.sub; g.font = FONT(400, 32); g.fillText('von Simon Wamsler', 48 + w + 18, 60); }
-  g.fillStyle = UI_COL.sub; g.font = FONT(400, 28); g.fillText(uiStatus(), 48, 104);
+  g.fillStyle = ar.snapped ? '#8ab4ff' : UI_COL.sub; fitText(g, uiStatus(), 48, 104, UI_W - 96, 400, 28);
   g.fillStyle = UI_COL.faint; g.fillRect(48, 132, UI_W - 96, 2);
   g.fillStyle = UI_COL.ink; g.font = FONT(500, 32); g.fillText('Größe', 48, 344);
-  g.fillStyle = UI_COL.sub; g.font = FONT(400, 26); g.fillText('Leiste unten greifen: verschieben', 48, 464); g.fillText('Stick drücken: Fenster herholen', 48, 500);
+  g.fillStyle = UI_COL.sub; fitText(g, 'Leiste unten greifen: Fenster verschieben · Stick drücken: Fenster herholen', 48, 574, UI_W - 96, 400, 25);
   for (const e of UI_EL) {
     const hot = ui.hover === e.id, off = disabled(e.id);
-    g.globalAlpha = off ? 0.35 : 1;
+    g.globalAlpha = off ? 0.4 : 1;
     if (e.slider) {
       const tr = sliderTrack(e), t = sliderT(ar.scale), kx = tr.x0 + (tr.x1 - tr.x0) * t;
       g.fillStyle = 'rgba(255,255,255,0.18)'; rr(g, tr.x0, tr.y - 6, tr.x1 - tr.x0, 12, 6); g.fill();
@@ -19851,6 +19867,17 @@ function drawUI() {
       g.fillStyle = hot ? UI_COL.hover : 'transparent'; rr(g, e.x, e.y + 12, e.w, e.h - 24, 18); g.fill();
       g.fillStyle = UI_COL.ink; g.font = FONT(600, 36); g.textAlign = 'center';
       g.fillText(scaleLabel(ar.scale), e.x + e.w / 2, e.y + e.h / 2 + 1); g.textAlign = 'left';
+      continue;
+    }
+    if (e.toggle) {                                    // Horizon-style switch: pill with label + knob
+      const on = ar.snapOn && !off;
+      g.fillStyle = hot && !off ? UI_COL.hover : UI_COL.btn; rr(g, e.x, e.y, e.w, e.h, e.h / 2); g.fill();
+      if (hot && !off) { g.strokeStyle = UI_COL.primary; g.lineWidth = 4; g.stroke(); }
+      const sw = 84, sh = 46, sx = e.x + e.w - sw - 26, sy = e.y + (e.h - sh) / 2;
+      g.fillStyle = on ? UI_COL.primary : 'rgba(255,255,255,0.25)'; rr(g, sx, sy, sw, sh, sh / 2); g.fill();
+      g.fillStyle = '#fff'; g.beginPath(); g.arc(on ? sx + sw - sh / 2 : sx + sh / 2, sy + sh / 2, sh / 2 - 5, 0, Math.PI * 2); g.fill();
+      g.fillStyle = UI_COL.ink; fitText(g, 'Wand-Ausrichtung', e.x + 36, e.y + e.h / 2 - 15, e.w - sw - 80, 600, 30);
+      g.fillStyle = UI_COL.sub; fitText(g, snapLabel().replace('Wand-Ausrichtung: ', ''), e.x + 36, e.y + e.h / 2 + 20, e.w - sw - 80, 400, 24);
       continue;
     }
     g.fillStyle = hot && !off ? UI_COL.hover : UI_COL.btn;
@@ -19935,6 +19962,7 @@ function uiAction(id) {
   else if (id === 'minus') setScale(Math.floor((ar.scale - 1e-4) * 10) / 10);
   else if (id === 'plus') setScale(Math.ceil((ar.scale + 1e-4) * 10) / 10);
   else if (id === 'value') setScale(1);
+  else if (id === 'snap') ar.snapOn = !ar.snapOn;
   else if (id === 'exit') app.xr.end();
 }
 // window placement: in front of the viewer, a bit to the left and below eye level, always facing them
@@ -19993,17 +20021,72 @@ function rayPick(origin, dir) {
   }
   return best ? { name: best, t: bestT } : null;
 }
+// whole piece (body included, not just the moving parts): its bounding box in modelRoot space
+const bodyMin = new pc.Vec3(), bodyMax = new pc.Vec3();
+function rayBody(origin, dir) {
+  invM.copy(modelRoot.getWorldTransform()).invert();
+  invM.transformPoint(origin, lo); invM.transformVector(dir, ld);
+  const sc = ld.length(); ld.mulScalar(1 / sc);
+  bodyMin.set(modelExt.minX, 0, modelExt.minZ); bodyMax.set(modelExt.maxX, modelExt.maxY, modelExt.maxZ);
+  const t = slab(lo, ld, bodyMin, bodyMax);
+  return t === null ? null : t / sc;
+}
 function rayFloor(origin, dir) {             // local-floor space: floor is y = 0
   if (dir.y > -1e-3) return null;
   const t = -origin.y / dir.y;
   return t > 0 && t < 15 ? new pc.Vec3().copy(dir).mulScalar(t).add(origin) : null;
 }
+function rayAtHeight(origin, dir, y) {      // ray against the horizontal plane at height y
+  if (Math.abs(dir.y) < 1e-4) return null;
+  const t = (y - origin.y) / dir.y;
+  if (t <= 0) return null;
+  return new pc.Vec3().copy(dir).mulScalar(Math.min(t, 12)).add(origin);
+}
+
+// ---- wall snap (Quest room setup -> WebXR plane detection)
+const wn = new pc.Vec3(), wl = new pc.Vec3(), wq = new pc.Quat();
+function wallPlanes() {
+  const list = app.xr.planeDetection.planes || [];
+  return list.filter(p => p.orientation === 'vertical' && !/door|window/i.test(p.label || ''));
+}
+function wallSnap(pos, yaw) {
+  if (!ar.snapOn || !app.xr.planeDetection.available) return null;
+  const s = ar.scale, back = -modelExt.minZ * s, half = Math.max(-modelExt.minX, modelExt.maxX) * s;
+  let best = null;
+  for (const p of wallPlanes()) {
+    const p0 = p.getPosition(); wq.copy(p.getRotation());
+    wq.transformVector(pc.Vec3.UP, wn); wn.y = 0;
+    if (wn.lengthSq() < 0.5) continue;
+    wn.normalize();
+    if ((pos.x - p0.x) * wn.x + (pos.z - p0.z) * wn.z < 0) wn.mulScalar(-1);   // normal into the room
+    const dc = (pos.x - p0.x) * wn.x + (pos.z - p0.z) * wn.z;              // wall -> piece centre
+    const gap = dc - back;                                                 // wall -> back panel
+    if (gap < -0.15 || gap > 0.3) continue;
+    const wallYaw = Math.atan2(wn.x, wn.z) * pc.math.RAD_TO_DEG;
+    const dy = Math.abs(((yaw - wallYaw) % 360 + 540) % 360 - 180);
+    if (dy > 25) continue;
+    // stay within the wall's extent (with some tolerance for the piece's width)
+    wl.set(pos.x - p0.x, 0, pos.z - p0.z); wq.invert().transformVector(wl, wl);
+    const pts = p.points || [];
+    if (pts.length) {
+      let mn = Infinity, mx = -Infinity;
+      for (const q of pts) { mn = Math.min(mn, q.x); mx = Math.max(mx, q.x); }
+      if (wl.x < mn - half * 0.5 || wl.x > mx + half * 0.5) continue;
+    }
+    if (!best || Math.abs(gap) < Math.abs(best.gap)) best = { gap, yaw: wallYaw, n: wn.clone(), dc, back };
+  }
+  if (!best) return null;
+  const k = best.back + 0.01 - best.dc;                                    // 1 cm off the wall
+  return { pos: new pc.Vec3(pos.x + best.n.x * k, 0, pos.z + best.n.z * k), yaw: best.yaw, id: best.yaw.toFixed(1) };
+}
+function pulse(src, v = 0.35, ms = 25) { try { src?.gamepad?.hapticActuators?.[0]?.pulse(v, ms); } catch (e) { } }
 
 // ---- session lifecycle
 function startAR() {
   if (!app.xr.isAvailable(pc.XRTYPE_AR)) return;
   app.xr.domOverlay.root = uiRoot;           // phones: HTML controls stay usable in AR
   camera.camera.startXr(pc.XRTYPE_AR, pc.XRSPACE_LOCALFLOOR, {
+    planeDetection: true,                    // walls from the Quest room setup, for the wall snap
     callback: err => { if (err) document.getElementById('ar-note').textContent = 'AR konnte nicht starten: ' + err.message; }
   });
 }
@@ -20016,6 +20099,7 @@ app.xr.on('start', () => {
   ar.shadows = sun.light.castShadows; sun.light.castShadows = false;
   try { app.xr.fixedFoveation = 0.5; } catch (e) { /* not supported */ }
   ar.mode = 'placing'; ar.hitOk = false; ar.viewerHitT = -1; ar.minY = Infinity; ar.yaw = 0;
+  ar.fresh = true; ar.snapped = null; ar.grabs.clear(); ar.two = null;
   setScale(1);
   // no DOM overlay (Quest Browser) -> controls live in the room instead
   ar.worldUI = QUEST || !app.xr.domOverlay.available;
@@ -20044,43 +20128,110 @@ app.xr.on('end', () => {
   document.body.classList.remove('xr');
   applyBg(); floor.enabled = true; blob.enabled = false; reticle.enabled = false; ui.root.enabled = false;
   sun.light.castShadows = ar.shadows;
-  ar.viewerHit?.remove?.(); ar.viewerHit = null; ar.mode = null; ui.drag = null;
+  ar.viewerHit?.remove?.(); ar.viewerHit = null; ar.mode = null; ui.drag = null; ar.grabs.clear(); ar.two = null;
   modelRoot.setPosition(0, 0, 0); modelRoot.setEulerAngles(0, 0, 0); setScale(1);
 });
 const replace = () => {
   if (!app.xr.active) return;
-  ar.mode = 'placing'; ar.hitOk = false; ar.viewerHitT = -1;
+  ar.mode = 'placing'; ar.hitOk = false; ar.viewerHitT = -1; ar.grabs.clear(); ar.two = null;
   arMsg.textContent = 'Boden anvisieren, dann tippen zum Platzieren';
 };
-const rotate = deg => { ar.yaw += deg; if (ar.mode === 'placed') modelRoot.rotateLocal(0, deg, 0); };
+// rotation goes to the target; the shown pose follows smoothly
+const rotate = deg => { if (ar.mode === 'placing') ar.yaw += deg; else if (ar.mode === 'placed') ar.tYaw += deg; };
+
+// ---- grabbing the piece: one hand drags it over the floor, two hands also turn and scale it
+function grabStart(src, kind) {
+  if (ar.mode !== 'placed') return false;
+  const o = src.getOrigin(), d = src.getDirection();
+  const t = rayBody(o, d);
+  if (t === null) return false;
+  const hp = d.clone().mulScalar(t).add(o);
+  ar.grabs.set(src, { src, kind, h: Math.max(0.05, hp.y), anchor: hp, offset: ar.tPos.clone().sub(hp), moved: false });
+  ar.grabs.get(src).offset.y = 0;
+  if (ar.grabs.size === 2) twoStart();
+  return true;
+}
+function grabEnd(src) {
+  const g = ar.grabs.get(src); if (!g) return;
+  ar.grabs.delete(src);
+  if (ar.two) {                                   // back to one hand: re-anchor the remaining one
+    ar.two = null;
+    for (const r of ar.grabs.values()) {
+      const p = rayAtHeight(r.src.getOrigin(), r.src.getDirection(), r.h);
+      if (p) { r.anchor = p; r.offset = ar.tPos.clone().sub(p); r.offset.y = 0; }
+      r.moved = true;
+    }
+  }
+  if (!ar.grabs.size && ar.snapped) { ar.tPos.copy(ar.dPos); ar.tYaw = ar.dYaw; }   // keep the snapped pose
+}
+function twoVec() {
+  const [a, b] = [...ar.grabs.values()];
+  const oa = a.src.getOrigin(), ob = b.src.getOrigin();
+  const vx = ob.x - oa.x, vz = ob.z - oa.z;
+  return { mid: new pc.Vec3((oa.x + ob.x) / 2, 0, (oa.z + ob.z) / 2), ang: Math.atan2(vx, vz) * pc.math.RAD_TO_DEG,
+    len: Math.max(0.02, Math.hypot(vx, vz, ob.y - oa.y)) };
+}
+function twoStart() {
+  const v = twoVec();
+  ar.two = { ...v, pos: ar.tPos.clone(), yaw: ar.tYaw, scale: ar.scale };
+  for (const g of ar.grabs.values()) g.moved = true;
+}
+function updateGrabs() {
+  if (ar.two) {
+    const v = twoVec(), t = ar.two;
+    let dAng = v.ang - t.ang; dAng = ((dAng % 360) + 540) % 360 - 180;
+    ar.tYaw = t.yaw + dAng;
+    setScale(t.scale * v.len / t.len, true);
+    ar.tPos.set(t.pos.x + (v.mid.x - t.mid.x), 0, t.pos.z + (v.mid.z - t.mid.z));
+    return;
+  }
+  for (const g of ar.grabs.values()) {
+    const p = rayAtHeight(g.src.getOrigin(), g.src.getDirection(), g.h);
+    if (!p) continue;
+    if (!g.moved && p.distance(g.anchor) > 0.04) g.moved = true;          // small jitter is still a tap
+    if (g.moved) ar.tPos.set(p.x + g.offset.x, 0, p.z + g.offset.z);
+  }
+}
 
 // press on the grab bar or the slider starts a drag; the click that follows is swallowed
 app.xr.input.on('selectstart', src => {
   ui.suppress.delete(src);
   const h = uiRay(src.getOrigin(), src.getDirection());
-  if (!h) return;
-  if (h.id === 'grab') {
-    const o = src.getOrigin(), d = src.getDirection(), p = ui.root.getPosition();
-    const dist = p.distance(o);
-    ui.drag = { src, kind: 'grab', dist, offset: p.clone().sub(d.clone().mulScalar(dist).add(o)) }; ui.moved = true;
-    ui.suppress.add(src);
-  } else if (h.id === 'slider') {
-    ui.drag = { src, kind: 'slider' };
-    sliderFromRay(src.getOrigin(), src.getDirection());
-    ui.suppress.add(src);
+  if (h) {
+    if (h.id === 'grab') {
+      const o = src.getOrigin(), d = src.getDirection(), p = ui.root.getPosition();
+      const dist = p.distance(o);
+      ui.drag = { src, kind: 'grab', dist, offset: p.clone().sub(d.clone().mulScalar(dist).add(o)) }; ui.moved = true;
+      ui.suppress.add(src);
+    } else if (h.id === 'slider') {
+      ui.drag = { src, kind: 'slider' };
+      sliderFromRay(src.getOrigin(), src.getDirection());
+      ui.suppress.add(src);
+    }
+    return;
   }
+  grabStart(src, 'select');
 });
-app.xr.input.on('selectend', src => { if (ui.drag?.src === src) ui.drag = null; });
+app.xr.input.on('selectend', src => {
+  if (ui.drag?.src === src) ui.drag = null;
+  if (ar.grabs.get(src)?.kind === 'select') grabEnd(src);
+});
+// controller grip grabs the piece too (never opens anything)
+app.xr.input.on('squeezestart', src => { if (!ar.grabs.has(src) && !uiRay(src.getOrigin(), src.getDirection())) grabStart(src, 'squeeze'); });
+app.xr.input.on('squeezeend', src => { if (ar.grabs.get(src)?.kind === 'squeeze') grabEnd(src); });
 
 // select = screen tap (phone), trigger or pinch (Quest)
 app.xr.input.on('select', src => {
   if (ui.suppress.delete(src)) return;
+  const g = ar.grabs.get(src);
+  if (g && g.moved) return;                          // that was a drag, not a tap
   const o = src.getOrigin(), d = src.getDirection();
   const h = uiRay(o, d);
   if (h) { uiAction(h.id); return; }                  // the panel is in front: never place or open through it
   if (ar.mode === 'placing') {
     if (!ar.hitOk) return;
     ar.mode = 'placed'; reticle.enabled = false;
+    ar.tPos.copy(ar.dPos); ar.tYaw = ar.dYaw;        // commit (snapped) preview
     arMsg.textContent = 'Tür oder Schublade antippen';
     if (ar.worldUI && !ui.moved) spawnUI();          // window back in view next to the freshly placed piece
     return;
@@ -20090,7 +20241,6 @@ app.xr.input.on('select', src => {
     if (hit) toggle(hit.name);
   }
 });
-app.xr.input.on('squeezestart', replace);    // Quest grip button: place again
 
 const camPos = new pc.Vec3(), lineEnd = new pc.Vec3(), BLUE = new pc.Color(0.03, 0.4, 1);
 app.on('update', dt => {
@@ -20108,6 +20258,7 @@ app.on('update', dt => {
     if (src.targetRayMode !== pc.XRTARGETRAY_POINTER) continue;
     const o = src.getOrigin(), d = src.getDirection();
     let col = WHITE, len = 3;
+    const grab = ar.grabs.get(src);
     if (ui.drag?.src === src) {
       if (ui.drag.kind === 'grab') {
         ui.root.setPosition(d.clone().mulScalar(ui.drag.dist).add(o).add(ui.drag.offset));
@@ -20118,6 +20269,9 @@ app.on('update', dt => {
         len = hitPlane(ui.panel, o, d, Infinity)?.t ?? 1;
       }
       col = BLUE;
+    } else if (grab) {
+      const p = rayAtHeight(o, d, grab.h);
+      len = p ? p.distance(o) : 2; col = ACCENT;
     } else {
       const h = uiRay(o, d);
       if (h) {
@@ -20130,11 +20284,12 @@ app.on('update', dt => {
       } else {
         const p = rayPick(o, d);
         if (p) { col = ACCENT; len = p.t; }
+        else { const b = rayBody(o, d); if (b !== null) len = b; }
       }
     }
     lineEnd.copy(d).mulScalar(len).add(o);
     app.drawLine(o, lineEnd, col);
-    // thumbstick turns the piece, A/X toggles all, B/Y places again
+    // thumbstick turns the piece, A/X toggles all, B/Y places again, stick click fetches the window
     const gp = src.gamepad;
     if (gp) {
       const ax = gp.axes.length >= 4 ? gp.axes[2] : 0;
@@ -20143,26 +20298,49 @@ app.on('update', dt => {
       const pressed = gp.buttons.map(b => b.pressed);
       if (pressed[4] && !prev[4]) toggleAll();
       if (pressed[5] && !prev[5]) replace();
-      if (pressed[3] && !prev[3] && ar.worldUI) spawnUI();     // thumbstick click: window back in front
+      if (pressed[3] && !prev[3] && ar.worldUI) spawnUI();
       ar.buttons.set(src, pressed);
     }
   }
-  if (ar.worldUI) { ui.hover = hover; ui.grabHover = grabHover; drawUI(); }
-  if (ar.mode !== 'placing') return;
-  // floor only: pointer ray on the floor plane, else (phones) a recent hit-test result on the lowest
-  // horizontal surface, else the floor where the user looks. Old results expire after 250 ms.
-  let target = pointerHit;
-  if (!target && !QUEST && performance.now() - ar.viewerHitT < 250) target = ar.viewerPos;
-  if (!target && (QUEST || !app.xr.hitTest.supported)) target = rayFloor(camera.getPosition(), camera.forward);
-  ar.hitOk = !!target;
-  if (!ar.hitOk) { reticle.enabled = false; return; }
-  ar.hit.copy(target);
-  reticle.enabled = true; reticle.setPosition(ar.hit);
-  // live preview, front turned towards the viewer
-  camPos.copy(camera.getPosition());
-  const face = Math.atan2(camPos.x - ar.hit.x, camPos.z - ar.hit.z) * pc.math.RAD_TO_DEG;
-  modelRoot.setPosition(ar.hit);
-  modelRoot.setEulerAngles(0, face + ar.yaw, 0);
+  if (ar.grabs.size) updateGrabs();
+
+  if (ar.mode === 'placing') {
+    // floor only: pointer ray on the floor plane, else (phones) a recent hit-test result on the lowest
+    // horizontal surface, else the floor where the user looks. Old results expire after 250 ms.
+    let target = pointerHit;
+    if (!target && !QUEST && performance.now() - ar.viewerHitT < 250) target = ar.viewerPos;
+    if (!target && (QUEST || !app.xr.hitTest.supported)) target = rayFloor(camera.getPosition(), camera.forward);
+    ar.hitOk = !!target;
+    if (ar.hitOk) {
+      ar.hit.copy(target);
+      camPos.copy(camera.getPosition());
+      ar.tPos.copy(ar.hit); ar.tPos.y = 0;
+      ar.tYaw = Math.atan2(camPos.x - ar.hit.x, camPos.z - ar.hit.z) * pc.math.RAD_TO_DEG + ar.yaw;   // front to the viewer
+      reticle.enabled = true; reticle.setPosition(ar.hit);
+    } else reticle.enabled = false;
+  }
+
+  // wall snap while placing or dragging (magnetic: releases once moved or turned far enough)
+  const moving = ar.mode === 'placing' || ar.two || [...ar.grabs.values()].some(g => g.moved);
+  const snap = moving ? wallSnap(ar.tPos, ar.tYaw) : null;
+  if (moving) {
+    if (snap && snap.id !== ar.snapped?.id) { for (const g of ar.grabs.values()) pulse(g.src); for (const s of app.xr.input.inputSources) if (!ar.grabs.size && s.targetRayMode === pc.XRTARGETRAY_POINTER) pulse(s, 0.25, 20); }
+    ar.snapped = snap;
+  }
+  if (snap) { ar.dPos.copy(snap.pos); ar.dYaw = snap.yaw; }
+  else if (moving || !ar.snapped) { ar.dPos.copy(ar.tPos); ar.dYaw = ar.tYaw; ar.snapped = null; }
+  else { ar.dPos.copy(ar.tPos); ar.dYaw = ar.tYaw; }
+
+  // smooth follow: position and heading glide instead of jumping with every jittery ray
+  if (ar.mode === 'placing' && !ar.hitOk) return;
+  if (ar.fresh) { ar.cPos.copy(ar.dPos); ar.cYaw = ar.dYaw; ar.fresh = false; }
+  const k = 1 - Math.exp(-dt * (ar.mode === 'placing' ? 12 : 16));
+  ar.cPos.lerp(ar.cPos, ar.dPos, k);
+  let dy = ar.dYaw - ar.cYaw; dy = ((dy % 360) + 540) % 360 - 180;
+  ar.cYaw += dy * k;
+  modelRoot.setPosition(ar.cPos);
+  modelRoot.setEulerAngles(0, ar.cYaw, 0);
+  if (ar.mode === 'placing' && ar.snapped) reticle.setPosition(ar.cPos);
 });
 
 // HTML controls inside the DOM overlay must not also count as an XR tap
@@ -20196,7 +20374,7 @@ function updateArButtons() {
   document.getElementById('ar-start').hidden = !webxr;
   document.getElementById('ql-row').hidden = !qlSupported;
   document.getElementById('ar-note').textContent =
-    webxr ? (QUEST ? 'Originalgröße 1:1. Zielen + Trigger oder Pinch öffnet. Das Bedienfeld (an der Leiste darunter verschiebbar) dreht, skaliert, platziert neu und beendet AR. Controller: Stick dreht, Stick drücken holt das Bedienfeld her, Grip platziert neu. Beenden auch über die Meta-Taste.'
+    webxr ? (QUEST ? 'Originalgröße 1:1. Zielen + Trigger oder Pinch öffnet. Das Bedienfeld (an der Leiste darunter verschiebbar) dreht, skaliert, platziert neu und beendet AR. Möbel greifen und ziehen verschiebt, mit zwei Händen drehen und skalieren, an Wänden richtet es sich aus. Controller: Stick dreht, Stick drücken holt das Bedienfeld her, B/Y platziert neu. Beenden auch über die Meta-Taste.'
              : 'Originalgröße 1:1. Boden anvisieren und tippen, dann Türen und Schubladen antippen.')
     : qlSupported ? 'Quick Look zeigt das Möbel in Originalgröße (ohne Interaktion).'
     : !window.isSecureContext ? 'AR braucht HTTPS. Seite über https:// öffnen.'
@@ -20226,6 +20404,16 @@ asset.ready(a => {
     }
     const p = s.node.getPosition();
     s.min = box.getMin().clone().sub(p); s.max = box.getMax().clone().sub(p);
+  }
+  { // outer box of the whole piece (modelRoot sits at the origin here): grabbing + wall snap
+    const all = new pc.BoundingBox(); let first = true;
+    for (const r of ent.findComponents('render')) for (const mi of r.meshInstances) {
+      if (first) { all.copy(mi.aabb); first = false; } else all.add(mi.aabb);
+    }
+    if (!first) {
+      const mn = all.getMin(), mx = all.getMax();
+      Object.assign(modelExt, { minX: mn.x, maxX: mx.x, minZ: mn.z, maxZ: mx.z, maxY: mx.y });
+    }
   }
   buildUI();
   document.getElementById('loading').remove();
