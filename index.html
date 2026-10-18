@@ -8,7 +8,7 @@
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
   :root {
-    --bg: #ecebe8; --panel: rgba(255,255,255,.82); --ink: #1d1c1a; --muted: #77736c;
+    --bg: #c9ccd0; --panel: rgba(255,255,255,.82); --ink: #1d1c1a; --muted: #6f7378;
     --line: rgba(0,0,0,.09); --accent: #b0773f; --accent-ink: #fff;
   }
   @media (prefers-color-scheme: dark) {
@@ -19511,7 +19511,7 @@ if ('toneMapping' in camera.camera) camera.camera.toneMapping = pc.TONEMAP_NEUTR
 else app.scene.toneMapping = pc.TONEMAP_ACES;
 camera.camera.layers = camera.camera.layers.filter(id => id !== pc.LAYERID_SKYBOX);  // env only for lighting
 app.root.addChild(camera);
-const applyBg = () => { camera.camera.clearColor = dark() ? new pc.Color(.106, .102, .098) : new pc.Color(.925, .922, .91); };
+const applyBg = () => { camera.camera.clearColor = dark() ? new pc.Color(.106, .102, .098) : new pc.Color(.788, .8, .816); };
 applyBg();
 matchMedia('(prefers-color-scheme: dark)').addEventListener('change', applyBg);
 
@@ -19539,7 +19539,7 @@ const floor = new pc.Entity('floor');
 floor.addComponent('render', { type: 'plane', material: floorMat, castShadows: false, receiveShadows: true });
 floor.setLocalScale(7, 1, 7);
 app.root.addChild(floor);
-const applyFloor = () => { floorMat.diffuse = dark() ? new pc.Color(.13, .125, .12) : new pc.Color(.86, .85, .83); floorMat.update(); };
+const applyFloor = () => { floorMat.diffuse = dark() ? new pc.Color(.13, .125, .12) : new pc.Color(.745, .757, .773); floorMat.update(); };
 applyFloor();
 matchMedia('(prefers-color-scheme: dark)').addEventListener('change', applyFloor);
 
