@@ -19478,7 +19478,12 @@ const app = new pc.Application(canvas, {
 });
 app.setCanvasFillMode(pc.FILLMODE_FILL_WINDOW);
 app.setCanvasResolution(pc.RESOLUTION_AUTO);
-app.graphicsDevice.maxPixelRatio = Math.min(window.devicePixelRatio, 2);
+// Quest Browser and phones: lighter render path (no TAA/SSAO/bloom, MSAA instead, cheaper shadows).
+// TAA in particular shimmers/flickers when the frame rate dips. ?lite forces it, ?hq forces the full path.
+const LOW_POWER = /[?&]hq\b/.test(location.search) ? false
+  : /[?&]lite\b/.test(location.search) || /OculusBrowser|Quest|Android|iPhone|iPad|Mobile/i.test(navigator.userAgent)
+    || (/Macintosh/.test(navigator.userAgent) && navigator.maxTouchPoints > 1);
+app.graphicsDevice.maxPixelRatio = Math.min(window.devicePixelRatio, LOW_POWER ? 1.5 : 2);
 window.addEventListener('resize', () => app.resizeCanvas());
 app.start();
 
@@ -19551,15 +19556,15 @@ let cframe = null;
 try {
   cframe = new pc.CameraFrame(app, camera.camera);
   cframe.rendering.toneMapping = pc.TONEMAP_NEUTRAL;
-  cframe.rendering.samples = 1;
-  cframe.rendering.sharpness = 0.25;
-  cframe.taa.enabled = true;
-  cframe.ssao.type = pc.SSAOTYPE_LIGHTING;
+  cframe.rendering.samples = LOW_POWER ? 4 : 1;      // low power: plain MSAA instead of TAA
+  cframe.rendering.sharpness = LOW_POWER ? 0 : 0.25;
+  cframe.taa.enabled = !LOW_POWER;
+  cframe.ssao.type = LOW_POWER ? pc.SSAOTYPE_NONE : pc.SSAOTYPE_LIGHTING;
   cframe.ssao.intensity = 0.45;
   cframe.ssao.radius = 0.12;                 // world units (m): contact scale
   cframe.ssao.power = 2;
   cframe.ssao.samples = 16;
-  cframe.bloom.intensity = 0.006;
+  cframe.bloom.intensity = LOW_POWER ? 0 : 0.006;
   cframe.vignette.intensity = 0.25;
   cframe.update();
 } catch (e) { console.warn('CameraFrame unavailable', e); cframe = null; }
@@ -19571,8 +19576,10 @@ matchMedia('(prefers-color-scheme: dark)').addEventListener('change', applyBg);
 const sun = new pc.Entity('sun');
 sun.addComponent('light', {
   type: 'directional', color: new pc.Color(1, .97, .92), intensity: 1.25, castShadows: true,
-  shadowType: pc.SHADOW_PCSS_32F ?? pc.SHADOW_PCF5_32F, shadowResolution: 4096, shadowDistance: 6,
-  shadowBias: 0.2, normalOffsetBias: 0.05, penumbraSize: 18
+  shadowType: LOW_POWER ? pc.SHADOW_PCF5_32F : (pc.SHADOW_PCSS_32F ?? pc.SHADOW_PCF5_32F),
+  shadowResolution: LOW_POWER ? 2048 : 4096, shadowDistance: 6,
+  shadowBias: 0.2, normalOffsetBias: 0.05, penumbraSize: 18,
+  shadowIntensity: LOW_POWER ? 0.55 : 1          // hard PCF edges read too strong without PCSS softening
 });
 sun.setEulerAngles(52, -32, 0);
 app.root.addChild(sun);
@@ -19847,9 +19854,9 @@ const modelExt = { minX: -1.03, maxX: 1.03, minZ: -0.25, maxZ: 0.25, maxY: 0.8 }
 // Quest Browser has no DOM overlay in AR and hands have no stick or grip, so the controls live in the
 // room: a floating window in the Horizon OS style (dark rounded panel, pill buttons, slider) with the
 // usual grab bar underneath. The window is independent of the furniture: grab the bar and move it.
-const UI_W = 1024, UI_H = 620, UI_M = 0.64;                 // canvas px, physical width in metres
+const UI_W = 1024, UI_H = 560, UI_M = 0.64;                 // canvas px, physical width in metres
 const UI_COL = {
-  panel: 'rgba(28,30,33,0.93)', btn: 'rgba(255,255,255,0.10)', hover: 'rgba(255,255,255,0.22)',
+  panel: 'rgba(28,30,33,0.96)', btn: 'rgba(255,255,255,0.10)', hover: 'rgba(255,255,255,0.22)',
   primary: '#0866ff', ink: '#e4e6eb', sub: '#b0b3b8', faint: 'rgba(255,255,255,0.08)'
 };
 const UI_EL = [];
@@ -19867,16 +19874,17 @@ const UI_EL = [];
   add('slider', 370, rowB, { slider: true }); x += 4;
   add('plus', 104, rowB, { label: '+', round: true, big: true }); x -= 4;
   add('value', 150, rowB, { value: true });
-  x = m;
-  add('snap', 470, rowC, { toggle: true });
   x = UI_W - m - 240;
   add('exit', 240, rowC, { label: 'Beenden' });
 }
 const ui = { root: null, panel: null, grab: null, hover: null, grabHover: false, drawn: '', drag: null, spawned: false, moved: false, tracked: 0, camStart: new pc.Vec3(), suppress: new Set() };
-const uiCanvas = document.createElement('canvas'); uiCanvas.width = UI_W; uiCanvas.height = UI_H;
+// two canvases, used in turn: the engine only re-uploads a texture when it gets a *different* source object,
+// so redrawing one canvas and handing it over again would leave the panel frozen on its first image
+const mkCanvas = (w, h) => { const c = document.createElement('canvas'); c.width = w; c.height = h; return c; };
+const uiCanvases = [mkCanvas(UI_W, UI_H), mkCanvas(UI_W, UI_H)], grabCanvases = [mkCanvas(256, 48), mkCanvas(256, 48)];
+let uiFlip = 0;
 const uiTex = new pc.Texture(app.graphicsDevice, { width: UI_W, height: UI_H, format: pc.PIXELFORMAT_RGBA8, name: 'arPanel', mipmaps: true });
 uiTex.minFilter = pc.FILTER_LINEAR_MIPMAP_LINEAR; uiTex.anisotropy = 4;
-const grabCanvas = document.createElement('canvas'); grabCanvas.width = 256; grabCanvas.height = 48;
 const grabTex = new pc.Texture(app.graphicsDevice, { width: 256, height: 48, format: pc.PIXELFORMAT_RGBA8, name: 'arGrab' });
 const FONT = (w, s) => `${w} ${s}px Inter, "Roboto", system-ui, sans-serif`;
 function rr(g, x, y, w, h, r) { g.beginPath(); g.roundRect ? g.roundRect(x, y, w, h, r) : g.rect(x, y, w, h); }
@@ -19915,6 +19923,8 @@ function drawUI() {
     Object.values(state).some(s => s.target === 1), uiStatus(), snapLabel()].join('|');
   if (key === ui.drawn) return;
   ui.drawn = key;
+  uiFlip ^= 1;
+  const uiCanvas = uiCanvases[uiFlip], grabCanvas = grabCanvases[uiFlip];
   const g = uiCanvas.getContext('2d');
   g.clearRect(0, 0, UI_W, UI_H);
   g.fillStyle = UI_COL.panel; rr(g, 0, 0, UI_W, UI_H, 40); g.fill();
@@ -19924,7 +19934,8 @@ function drawUI() {
   g.fillStyle = ar.snapped ? '#8ab4ff' : UI_COL.sub; fitText(g, uiStatus(), 48, 104, UI_W - 96, 400, 28);
   g.fillStyle = UI_COL.faint; g.fillRect(48, 132, UI_W - 96, 2);
   g.fillStyle = UI_COL.ink; g.font = FONT(500, 32); g.fillText('Größe', 48, 344);
-  g.fillStyle = UI_COL.sub; fitText(g, 'Leiste unten greifen: Fenster verschieben · Stick drücken: Fenster herholen', 48, 574, UI_W - 96, 400, 25);
+  g.fillStyle = UI_COL.sub; fitText(g, 'Leiste unten greifen: Fenster verschieben', 48, 464, 600, 400, 25);
+  fitText(g, 'Stick drücken: Fenster herholen', 48, 500, 600, 400, 25);
   for (const e of UI_EL) {
     const hot = ui.hover === e.id, off = disabled(e.id);
     g.globalAlpha = off ? 0.4 : 1;
@@ -19982,9 +19993,11 @@ function uiPlane(name, tex, w, h) {
   m.useLighting = false; m.useSkybox = false; m.useFog = false; m.useTonemap = false;
   m.diffuse = new pc.Color(0, 0, 0); m.emissive = WHITE; m.emissiveMap = tex;
   m.opacityMap = tex; m.opacityMapChannel = 'a'; m.blendType = pc.BLEND_NORMAL; m.depthWrite = false;
+  m.depthTest = false;                      // a control window is always readable, never hidden in the furniture
   m.update();
   const e = new pc.Entity(name);
-  e.addComponent('render', { type: 'plane', material: m, castShadows: false, receiveShadows: false });
+  // UI layer: drawn after the whole 3D scene (incl. transparent parts of the model)
+  e.addComponent('render', { type: 'plane', material: m, castShadows: false, receiveShadows: false, layers: [pc.LAYERID_UI] });
   e.setLocalScale(w, 1, h);
   e.setLocalEulerAngles(90, 0, 0);          // plane normal (+Y) -> root +Z (towards the viewer), texture top up
   return e;
