@@ -20438,6 +20438,7 @@ app.on('update', dt => {
       ar.buttons.set(src, pressed);
     }
   }
+  if (ar.worldUI) { ui.hover = hover; ui.grabHover = grabHover; drawUI(); }   // redraws only when something changed
   if (ar.two) updateTwo();
 
   if (ar.mode === 'placing') {
