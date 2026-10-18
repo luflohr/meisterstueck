@@ -19749,7 +19749,122 @@ reticle.setLocalScale(0.3, 1, 0.3); reticle.enabled = false;
 app.root.addChild(reticle);
 
 const QUEST = /OculusBrowser|Quest/i.test(navigator.userAgent);
-const ar = { mode: null, yaw: 0, hit: new pc.Vec3(), hitOk: false, viewerHit: null, viewerHitOk: false, buttons: new Map() };
+const ar = {
+  mode: null, yaw: 0, hit: new pc.Vec3(), hitOk: false, viewerHit: null,
+  viewerPos: new pc.Vec3(), viewerHitT: -1, minY: Infinity, buttons: new Map(), worldUI: false,
+  shadows: true
+};
+
+// ---- in-world menu (Quest Browser shows no DOM overlay in AR, and hands have no stick or grip)
+// A sign floating above the piece: status line + buttons. Hit-tested with the controller or hand ray.
+const MENU_W = 1152, MENU_H = 380, MENU_M = { w: 0.88, h: 0.88 * MENU_H / MENU_W };
+const menuCanvas = document.createElement('canvas'); menuCanvas.width = MENU_W; menuCanvas.height = MENU_H;
+const menuTex = new pc.Texture(app.graphicsDevice, { width: MENU_W, height: MENU_H, format: pc.PIXELFORMAT_RGBA8, name: 'arMenu', mipmaps: true });
+menuTex.minFilter = pc.FILTER_LINEAR_MIPMAP_LINEAR; menuTex.anisotropy = 4;
+const MENU_BTNS = [
+  { id: 'place', w: 290, label: 'Neu platzieren' },
+  { id: 'left',  w: 130, icon: 'ccw' },
+  { id: 'right', w: 130, icon: 'cw' },
+  { id: 'all',   w: 290, label: () => Object.values(state).some(s => s.target === 1) ? 'Alle schließen' : 'Alle öffnen' },
+  { id: 'exit',  w: 200, label: 'Beenden', exit: true },
+];
+{ // lay the buttons out in one row
+  const gap = 16, total = MENU_BTNS.reduce((a, b) => a + b.w, 0) + gap * (MENU_BTNS.length - 1);
+  let x = (MENU_W - total) / 2;
+  for (const b of MENU_BTNS) { b.x = x; b.y = 172; b.h = 160; x += b.w + gap; }
+}
+const menu = { hover: -1, drawn: '', ent: null };
+function rr(g, x, y, w, h, r) { g.beginPath(); g.roundRect ? g.roundRect(x, y, w, h, r) : g.rect(x, y, w, h); }
+function arrow(g, cx, cy, cw) {           // circular arrow, drawn so it never depends on a font glyph
+  g.save(); g.translate(cx, cy); if (!cw) g.scale(-1, 1);     // counter-clockwise = mirrored clockwise
+  const r = 34, a0 = -Math.PI * 0.85, a1 = Math.PI * 0.45;
+  g.lineWidth = 10; g.lineCap = 'round'; g.beginPath(); g.arc(0, 0, r, a0, a1); g.stroke();
+  const ex = r * Math.cos(a1), ey = r * Math.sin(a1), t = a1 + Math.PI / 2;
+  g.beginPath();
+  g.moveTo(ex + 18 * Math.cos(t), ey + 18 * Math.sin(t));
+  g.lineTo(ex + 15 * Math.cos(t + 2.3), ey + 15 * Math.sin(t + 2.3));
+  g.lineTo(ex + 15 * Math.cos(t - 2.3), ey + 15 * Math.sin(t - 2.3));
+  g.closePath(); g.fill(); g.restore();
+}
+function menuStatus() {
+  return ar.mode === 'placing' ? 'Auf den Boden zielen · Trigger oder Pinch stellt das Möbel ab'
+    : 'Tür oder Schublade anzielen · Trigger oder Pinch öffnet';
+}
+function drawMenu() {
+  const placing = ar.mode === 'placing';
+  const key = [ar.mode, menu.hover, MENU_BTNS.map(b => typeof b.label === 'function' ? b.label() : '').join()].join('|');
+  if (key === menu.drawn) return;
+  menu.drawn = key;
+  const g = menuCanvas.getContext('2d');
+  g.clearRect(0, 0, MENU_W, MENU_H);
+  g.fillStyle = 'rgba(24,23,21,0.86)'; rr(g, 0, 0, MENU_W, placing ? 148 : MENU_H, 36); g.fill();
+  g.fillStyle = '#efede8'; g.textAlign = 'center'; g.textBaseline = 'middle';
+  g.font = '600 44px Inter, "Roboto", system-ui, sans-serif';
+  g.fillText('Meisterstück', MENU_W / 2, 50);
+  g.font = '400 34px Inter, "Roboto", system-ui, sans-serif'; g.fillStyle = '#c9c4ba';
+  g.fillText(menuStatus(), MENU_W / 2, 106);
+  if (placing) { menuTex.setSource(menuCanvas); return; }
+  MENU_BTNS.forEach((b, i) => {
+    const hot = i === menu.hover;
+    g.fillStyle = hot ? '#d39a5c' : b.exit ? 'rgba(255,255,255,0.08)' : 'rgba(255,255,255,0.14)';
+    rr(g, b.x, b.y, b.w, b.h, 24); g.fill();
+    if (b.exit && !hot) { g.strokeStyle = 'rgba(211,154,92,0.9)'; g.lineWidth = 4; rr(g, b.x + 2, b.y + 2, b.w - 4, b.h - 4, 22); g.stroke(); }
+    const ink = hot ? '#1b1a19' : '#efede8';
+    g.fillStyle = ink; g.strokeStyle = ink;
+    if (b.icon) arrow(g, b.x + b.w / 2, b.y + b.h / 2, b.icon === 'cw');
+    else {
+      g.font = '600 40px Inter, "Roboto", system-ui, sans-serif';
+      g.fillText(typeof b.label === 'function' ? b.label() : b.label, b.x + b.w / 2, b.y + b.h / 2 + 1);
+    }
+  });
+  menuTex.setSource(menuCanvas);
+}
+{
+  const m = new pc.StandardMaterial();
+  m.useLighting = false; m.useSkybox = false; m.useFog = false; m.useTonemap = false;
+  m.diffuse = new pc.Color(0, 0, 0); m.emissive = WHITE; m.emissiveMap = menuTex;
+  m.opacityMap = menuTex; m.opacityMapChannel = 'a'; m.blendType = pc.BLEND_NORMAL; m.depthWrite = false;
+  m.update();
+  menu.ent = new pc.Entity('arMenu');
+  menu.ent.addComponent('render', { type: 'plane', material: m, castShadows: false, receiveShadows: false });
+  menu.ent.setLocalScale(MENU_M.w, 1, MENU_M.h);
+  menu.ent.enabled = false;
+  modelRoot.addChild(menu.ent);
+}
+function placeMenu(top, frontZ) {           // above the piece, a little forward, tipped towards the viewer
+  menu.ent.setLocalPosition(0, top + 0.42, frontZ - 0.12);
+  menu.ent.setLocalEulerAngles(78, 0, 0);
+}
+placeMenu(0.8, 0.25);
+// ray -> button index (or -2 for "panel, but no button"), with distance
+const menuInv = new pc.Mat4(), mo = new pc.Vec3(), md = new pc.Vec3();
+function rayMenu(origin, dir) {
+  if (!menu.ent.enabled) return null;
+  menuInv.copy(menu.ent.getWorldTransform()).invert();
+  menuInv.transformPoint(origin, mo); menuInv.transformVector(dir, md);
+  if (Math.abs(md.y) < 1e-6) return null;
+  const t = -mo.y / md.y; if (t <= 0) return null;
+  const x = mo.x + md.x * t, z = mo.z + md.z * t;
+  if (x < -0.5 || x > 0.5 || z < -0.5 || z > 0.5) return null;
+  const px = (x + 0.5) * MENU_W, py = (z + 0.5) * MENU_H;
+  if (ar.mode === 'placing' && py > 148) return null;    // only the status strip is drawn while placing
+  const world = new pc.Vec3(md.x, md.y, md.z).mulScalar(t);
+  menu.ent.getWorldTransform().transformVector(world, world);
+  const i = ar.mode === 'placing' ? -1 : MENU_BTNS.findIndex(b => px >= b.x && px <= b.x + b.w && py >= b.y && py <= b.y + b.h);
+  return { index: i < 0 ? -2 : i, t: world.length() };
+}
+function menuAction(i) {
+  const b = MENU_BTNS[i]; if (!b) return;
+  if (b.id === 'place') replace();
+  else if (b.id === 'left') rotate(15);
+  else if (b.id === 'right') rotate(-15);
+  else if (b.id === 'all') toggleAll();
+  else if (b.id === 'exit') app.xr.end();
+}
+function toggleAll() {
+  const anyOpen = Object.values(state).some(s => s.target === 1);
+  Object.keys(state).forEach(n => { if (anyOpen ? !PARTS[n].needs : true) setOpen(n, !anyOpen); });
+}
 
 // ---- ray picking against per-part boxes (local space, so it follows doors/drawers as they move)
 const invM = new pc.Mat4(), lo = new pc.Vec3(), ld = new pc.Vec3();
@@ -19790,30 +19905,51 @@ function startAR() {
     callback: err => { if (err) document.getElementById('ar-note').textContent = 'AR konnte nicht starten: ' + err.message; }
   });
 }
+const hitNormal = new pc.Vec3();
 app.xr.on('start', () => {
   document.body.classList.add('xr');
   camera.camera.clearColor = new pc.Color(0, 0, 0, 0);
   floor.enabled = false; blob.enabled = true;
-  ar.mode = 'placing'; ar.hitOk = false; ar.viewerHitOk = false; ar.yaw = 0;
+  // per-eye soft shadow maps are the most expensive thing on screen; the contact shadow is enough in AR
+  ar.shadows = sun.light.castShadows; sun.light.castShadows = false;
+  try { app.xr.fixedFoveation = 0.5; } catch (e) { /* not supported */ }
+  ar.mode = 'placing'; ar.hitOk = false; ar.viewerHitT = -1; ar.minY = Infinity; ar.yaw = 0;
+  // no DOM overlay (Quest Browser) -> controls live in the room instead
+  ar.worldUI = !app.xr.domOverlay.available;
+  menu.ent.enabled = ar.worldUI; menu.hover = -1; menu.drawn = ''; drawMenu();
   arMsg.textContent = 'Boden anvisieren, dann tippen zum Platzieren';
-  if (app.xr.hitTest.supported) {
+  // phones: hit test from the screen centre, floor only. Quest knows its floor exactly (local-floor y = 0),
+  // so it never uses hit-test results, which could land on a table or a wall.
+  if (!QUEST && app.xr.hitTest.supported) {
     app.xr.hitTest.start({
       spaceType: pc.XRSPACE_VIEWER,
       callback: (err, src) => {
         if (err || !src) return;
         ar.viewerHit = src;
-        src.on('result', pos => { ar.hit.copy(pos); ar.viewerHitOk = true; });
+        src.on('result', (pos, rot) => {
+          rot.transformVector(pc.Vec3.UP, hitNormal);
+          if (hitNormal.y < 0.85) return;                       // walls, slopes
+          ar.minY = Math.min(ar.minY, pos.y);
+          if (pos.y > ar.minY + 0.15) return;                   // table tops, sofas: above the lowest surface seen
+          ar.viewerPos.copy(pos); ar.viewerHitT = performance.now();
+        });
       }
     });
   }
 });
 app.xr.on('end', () => {
   document.body.classList.remove('xr');
-  applyBg(); floor.enabled = true; blob.enabled = false; reticle.enabled = false;
+  applyBg(); floor.enabled = true; blob.enabled = false; reticle.enabled = false; menu.ent.enabled = false;
+  sun.light.castShadows = ar.shadows;
   ar.viewerHit?.remove?.(); ar.viewerHit = null; ar.mode = null;
   modelRoot.setPosition(0, 0, 0); modelRoot.setEulerAngles(0, 0, 0);
 });
-const replace = () => { if (app.xr.active) { ar.mode = 'placing'; arMsg.textContent = 'Boden anvisieren, dann tippen zum Platzieren'; } };
+const replace = () => {
+  if (!app.xr.active) return;
+  ar.mode = 'placing'; ar.hitOk = false; ar.viewerHitT = -1;
+  arMsg.textContent = 'Boden anvisieren, dann tippen zum Platzieren';
+  drawMenu();
+};
 const rotate = deg => { ar.yaw += deg; if (ar.mode === 'placed') modelRoot.rotateLocal(0, deg, 0); };
 
 // select = screen tap (phone), trigger or pinch (Quest)
@@ -19822,10 +19958,13 @@ app.xr.input.on('select', src => {
     if (!ar.hitOk) return;
     ar.mode = 'placed'; reticle.enabled = false;
     arMsg.textContent = 'Tür oder Schublade antippen';
+    drawMenu();
     return;
   }
   if (ar.mode === 'placed') {
-    const hit = rayPick(src.getOrigin(), src.getDirection());
+    const o = src.getOrigin(), d = src.getDirection();
+    const m = rayMenu(o, d), hit = rayPick(o, d);
+    if (m && (!hit || m.t < hit.t)) { if (m.index >= 0) menuAction(m.index); return; }
     if (hit) toggle(hit.name);
   }
 });
@@ -19835,7 +19974,7 @@ const camPos = new pc.Vec3(), lineEnd = new pc.Vec3();
 app.on('update', dt => {
   if (!app.xr.active || !ar.mode) return;
   // pointer devices (Quest controllers / hands) override the head/screen-centre hit test
-  let pointerHit = null;
+  let pointerHit = null, hover = -1;
   for (const src of app.xr.input.inputSources) {
     if (src.targetRayMode !== pc.XRTARGETRAY_POINTER) continue;
     const o = src.getOrigin(), d = src.getDirection();
@@ -19844,8 +19983,9 @@ app.on('update', dt => {
       const f = rayFloor(o, d);
       if (f) { pointerHit = f; len = f.distance(o); }
     } else {
-      const h = rayPick(o, d);
-      if (h) { col = ACCENT; len = h.t; }
+      const h = rayPick(o, d), m = rayMenu(o, d);
+      if (m && (!h || m.t < h.t)) { len = m.t; if (m.index >= 0) { col = ACCENT; hover = m.index; } }
+      else if (h) { col = ACCENT; len = h.t; }
     }
     lineEnd.copy(d).mulScalar(len).add(o);
     app.drawLine(o, lineEnd, col);
@@ -19856,23 +19996,21 @@ app.on('update', dt => {
       if (Math.abs(ax) > 0.25) rotate(-ax * 90 * dt);
       const prev = ar.buttons.get(src) || [];
       const pressed = gp.buttons.map(b => b.pressed);
-      if (pressed[4] && !prev[4]) {
-        const anyOpen = Object.values(state).some(s => s.target === 1);
-        Object.keys(state).forEach(n => { if (anyOpen ? !PARTS[n].needs : true) setOpen(n, !anyOpen); });
-      }
+      if (pressed[4] && !prev[4]) toggleAll();
       if (pressed[5] && !prev[5]) replace();
       ar.buttons.set(src, pressed);
     }
   }
+  if (ar.worldUI) { menu.hover = hover; drawMenu(); }
   if (ar.mode !== 'placing') return;
-  if (pointerHit) ar.hit.copy(pointerHit);
-  ar.hitOk = !!pointerHit || ar.viewerHitOk;
-  // Quest knows its floor exactly; phones only guess it, so they wait for a real hit-test result
-  if (!ar.hitOk && (QUEST || !app.xr.hitTest.supported)) {   // preview on the floor where the user looks
-    const f = rayFloor(camera.getPosition(), camera.forward);
-    if (f) { ar.hit.copy(f); ar.hitOk = true; }
-  }
-  if (!ar.hitOk) return;
+  // floor only: pointer ray on the floor plane, else (phones) a recent hit-test result on the lowest
+  // horizontal surface, else the floor where the user looks. Old results expire after 250 ms.
+  let target = pointerHit;
+  if (!target && !QUEST && performance.now() - ar.viewerHitT < 250) target = ar.viewerPos;
+  if (!target && (QUEST || !app.xr.hitTest.supported)) target = rayFloor(camera.getPosition(), camera.forward);
+  ar.hitOk = !!target;
+  if (!ar.hitOk) { reticle.enabled = false; return; }
+  ar.hit.copy(target);
   reticle.enabled = true; reticle.setPosition(ar.hit);
   // live preview at real size, front turned towards the viewer
   camPos.copy(camera.getPosition());
@@ -19890,7 +20028,6 @@ document.getElementById('ar-place').onclick = replace;
 document.getElementById('ar-left').onclick = () => rotate(15);
 document.getElementById('ar-right').onclick = () => rotate(-15);
 document.getElementById('ar-exit').onclick = () => app.xr.end();
-
 // ---- availability / platform buttons
 function quickLook(b64) {
   const data = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
@@ -19909,7 +20046,8 @@ function updateArButtons() {
   document.getElementById('ar-start').hidden = !webxr;
   document.getElementById('ql-row').hidden = !qlSupported;
   document.getElementById('ar-note').textContent =
-    webxr ? 'Originalgröße 1:1. Quest: zeigen + Trigger öffnet, Stick dreht, Grip platziert neu.'
+    webxr ? (QUEST ? 'Originalgröße 1:1. Zielen + Trigger oder Pinch öffnet. Das Schild über dem Möbel dreht, platziert neu und beendet AR. Controller: Stick dreht, Grip platziert neu. Beenden auch über die Meta-Taste.'
+             : 'Originalgröße 1:1. Boden anvisieren und tippen, dann Türen und Schubladen antippen.')
     : qlSupported ? 'Quick Look zeigt das Möbel in Originalgröße (ohne Interaktion).'
     : !window.isSecureContext ? 'AR braucht HTTPS. Seite über https:// öffnen.'
     : 'AR: auf Android (Chrome), Meta Quest Browser oder iPhone öffnen.';
@@ -19938,6 +20076,13 @@ asset.ready(a => {
     }
     const p = s.node.getPosition();
     s.min = box.getMin().clone().sub(p); s.max = box.getMax().clone().sub(p);
+  }
+  { // fit the AR menu sign above the piece
+    const all = new pc.BoundingBox(); let first = true;
+    for (const r of ent.findComponents('render')) for (const mi of r.meshInstances) {
+      if (first) { all.copy(mi.aabb); first = false; } else all.add(mi.aabb);
+    }
+    if (!first) placeMenu(all.getMax().y, all.getMax().z);
   }
   buildUI();
   document.getElementById('loading').remove();
